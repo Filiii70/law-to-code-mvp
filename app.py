@@ -1,368 +1,208 @@
+# app.py
 """
-Law-to-Code MVP Prototype — DCL + CLEARANCE
-Single-file FastAPI app providing:
-- / (GET): Minimal UI to try DCL parsing and CLEARANCE checks in the browser
-- /dcl/parse (POST): Parses ultra-simple rule text into a JSON schema (the DCL output)
-- /clearance/check (POST): Evaluates data against the DCL schema and returns a proof log with a SHA256 hash
+Law-to-Code MVP — DCL + CLEARANCE + Storage (PostgreSQL)
+Routes:
+  GET  /                : mini UI/hello
+  GET  /docs            : Swagger
+  GET  /health          : DB healthcheck
+  POST /dcl/parse       : parse rule-text → JSON schema
+  POST /clearance/check : evaluate + persist proof
+  GET  /proofs          : list proofs (paginated)
+  GET  /proofs/{id}     : get single proof
 
-Run locally:
-  pip install fastapi uvicorn pydantic[dotenv] python-multipart
-  uvicorn app:app --reload --port 8000
-Then open http://localhost:8000
-
-This is a toy MVP for a "first wow": it demonstrates Law → DCL → CLEARANCE → Proof.
+Env:
+  DATABASE_URL = postgresql://USER:PASS@HOST:PORT/DB (Render Internal URL)
+  API_KEY      = optional; when set, POST routes require header: x-api-key: <API_KEY>
 """
+
 from __future__ import annotations
 
-import hashlib
-import json
+import os, json, re, hashlib
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional, List, Dict
+from uuid import uuid4
 
-from fastapi import FastAPI, Body
-from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, Field, ValidationError
+from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 
-app = FastAPI(title="Law-to-Code MVP: DCL + CLEARANCE")
+# --- SQLAlchemy / Postgres ---
+from sqlalchemy import create_engine, Column, String, DateTime, Text, JSON, Integer
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
-# -------------------------
-# DCL MODELS (very simple)
-# -------------------------
-class DCLRule(BaseModel):
-    id: str
-    type: str  # required | equals | max | min | in
-    field: str
-    value: Optional[Any] = None
+DATABASE_URL = os.getenv("DATABASE_URL")
+API_KEY = (os.getenv("API_KEY") or "").strip()
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL env var is required")
 
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+Base = declarative_base()
+
+class Proof(Base):
+    __tablename__ = "proofs"
+    id = Column(String, primary_key=True, default=lambda: str(uuid4()))
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    rule_text = Column(Text, nullable=False)
+    data = Column(JSON, nullable=False)
+    result = Column(String(8), nullable=False)      # "pass" | "fail"
+    hash = Column(String(64), nullable=False)       # sha256
+    proof_log = Column(JSON, nullable=False)        # full structured log
+
+Base.metadata.create_all(bind=engine)
+
+def db() -> Session:
+    s = SessionLocal()
+    try:
+        yield s
+    finally:
+        s.close()
+
+def require_api_key(x_api_key: Optional[str]) -> None:
+    if API_KEY and (x_api_key or "").strip() != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+# --- FastAPI ---
+app = FastAPI(title="Law-to-Code MVP — DCL + CLEARANCE + Storage")
+
+# ---- DCL toy parser ----
 class DCLSchema(BaseModel):
-    law_title: str = "Untitled Law Snippet"
-    rules: List[DCLRule]
-    source_text: str
-    generated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-
-# -------------------------
-# CLEARANCE MODELS
-# -------------------------
-class ClearanceResult(BaseModel):
-    rule_id: str
     field: str
-    passed: bool
-    details: str
+    op: str
+    value: Any
 
-class ProofLog(BaseModel):
-    law_title: str
-    schema: DCLSchema
-    data_checked: Dict[str, Any]
-    results: List[ClearanceResult]
-    overall_passed: bool
-    generated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    proof_hash: str
-
-# -------------------------
-# DCL PARSER (ultra-simple)
-# -------------------------
-"""
-Supported rule lines (case-insensitive, one per line):
-  require <field>
-  equals <field> <value>
-  max <field> <number>
-  min <field> <number>
-  in <field> [a,b,c]
-Examples:
-  require manufacturer
-  max weight 50
-  in category [electronics, furniture, toys]
-  equals country BE
-"""
-
-def parse_rule_line(line: str, idx: int) -> Optional[DCLRule]:
-    raw = line.strip()
-    if not raw or raw.startswith("#"):  # comments allowed
-        return None
-    parts = raw.split()
-    if len(parts) < 2:
-        return None
-
-    keyword = parts[0].lower()
-    if keyword == "require" and len(parts) >= 2:
-        field = parts[1]
-        return DCLRule(id=f"r{idx}", type="required", field=field)
-
-    if keyword == "equals" and len(parts) >= 3:
-        field = parts[1]
-        value = " ".join(parts[2:])
-        # Try cast to int/float/bool if looks like it
-        casted = auto_cast(value)
-        return DCLRule(id=f"r{idx}", type="equals", field=field, value=casted)
-
-    if keyword == "max" and len(parts) >= 3:
-        field = parts[1]
-        value = auto_cast(parts[2])
-        return DCLRule(id=f"r{idx}", type="max", field=field, value=value)
-
-    if keyword == "min" and len(parts) >= 3:
-        field = parts[1]
-        value = auto_cast(parts[2])
-        return DCLRule(id=f"r{idx}", type="min", field=field, value=value)
-
-    if keyword == "in" and len(parts) >= 3:
-        field = parts[1]
-        bracket = raw[raw.find("[") : raw.rfind("]") + 1]
-        try:
-            items = [auto_cast(x.strip()) for x in bracket.strip("[]").split(",") if x.strip()]
-        except Exception:
-            items = [bracket]
-        return DCLRule(id=f"r{idx}", type="in", field=field, value=items)
-
-    return None
-
-
-def auto_cast(txt: str) -> Any:
-    t = txt.strip()
-    # Attempt bool
-    if t.lower() in {"true", "false"}:
-        return t.lower() == "true"
-    # Attempt int
-    try:
-        return int(t)
-    except ValueError:
-        pass
-    # Attempt float
-    try:
-        return float(t)
-    except ValueError:
-        pass
-    # Strip quotes if present
-    if (t.startswith("'") and t.endswith("'")) or (t.startswith('"') and t.endswith('"')):
-        return t[1:-1]
-    return t
-
-# -------------------------
-# CLEARANCE EVALUATION
-# -------------------------
-
-def evaluate(schema: DCLSchema, data: Dict[str, Any]) -> Tuple[List[ClearanceResult], bool]:
-    results: List[ClearanceResult] = []
-    overall = True
-
-    for rule in schema.rules:
-        field_value = data.get(rule.field, None)
-        if rule.type == "required":
-            passed = rule.field in data and data[rule.field] not in (None, "")
-            details = f"Field '{rule.field}' is required; present={passed}"
-        elif rule.type == "equals":
-            passed = field_value == rule.value
-            details = f"Field '{rule.field}' must equal {rule.value!r}; actual={field_value!r}"
-        elif rule.type == "max":
-            try:
-                passed = float(field_value) <= float(rule.value)
-            except Exception:
-                passed = False
-            details = f"Field '{rule.field}' must be <= {rule.value}; actual={field_value}"
-        elif rule.type == "min":
-            try:
-                passed = float(field_value) >= float(rule.value)
-            except Exception:
-                passed = False
-            details = f"Field '{rule.field}' must be >= {rule.value}; actual={field_value}"
-        elif rule.type == "in":
-            options = rule.value if isinstance(rule.value, list) else []
-            passed = field_value in options
-            details = f"Field '{rule.field}' must be in {options}; actual={field_value}"
-        else:
-            passed = False
-            details = f"Unknown rule type: {rule.type}"
-
-        results.append(ClearanceResult(rule_id=rule.id, field=rule.field, passed=passed, details=details))
-        if not passed:
-            overall = False
-
-    return results, overall
-
-
-def proof_hash(payload: Dict[str, Any]) -> str:
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(canonical).hexdigest()
-
-# -------------------------
-# API ROUTES
-# -------------------------
 class ParseRequest(BaseModel):
-    law_text: str
-    law_title: Optional[str] = None
-
-@app.post("/dcl/parse", response_model=DCLSchema)
-async def dcl_parse(req: ParseRequest):
-    lines = req.law_text.splitlines()
-    rules = []
-    for i, line in enumerate(lines, start=1):
-        r = parse_rule_line(line, i)
-        if r:
-            rules.append(r)
-    return DCLSchema(law_title=req.law_title or "Law Snippet", rules=rules, source_text=req.law_text)
+    text: str = Field(..., description='e.g. "age >= 18"')
 
 class ClearanceRequest(BaseModel):
-    schema: DCLSchema
+    rule: str
     data: Dict[str, Any]
 
-@app.post("/clearance/check", response_model=ProofLog)
-async def clearance_check(req: ClearanceRequest):
-    results, overall = evaluate(req.schema, req.data)
-    payload = {
-        "law_title": req.schema.law_title,
-        "schema": json.loads(req.schema.model_dump_json()),
-        "data_checked": req.data,
-        "results": [r.model_dump() for r in results],
-        "overall_passed": overall,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+def parse_rule(text: str) -> DCLSchema:
+    # minimal parser: <field> <op> <value>
+    m = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*(==|!=|>=|<=|>|<)\s*(.+?)\s*$", text)
+    if not m:
+        raise HTTPException(400, "Unsupported rule format. Try: age >= 18")
+    field, op, raw = m.groups()
+    # try to coerce numeric/bool; else string without quotes needed
+    try:
+        if raw.lower() in ("true", "false"):
+            val: Any = raw.lower() == "true"
+        else:
+            val = int(raw) if raw.isdigit() else float(raw)
+    except:
+        val = raw.strip().strip('"').strip("'")
+    return DCLSchema(field=field, op=op, value=val)
+
+def evaluate(schema: DCLSchema, data: Dict[str, Any]) -> bool:
+    if schema.field not in data:
+        return False
+    left = data[schema.field]
+    right = schema.value
+    ops = {
+        "==": lambda a,b: a == b,
+        "!=": lambda a,b: a != b,
+        ">=": lambda a,b: a >= b,
+        "<=": lambda a,b: a <= b,
+        ">":  lambda a,b: a >  b,
+        "<":  lambda a,b: a <  b,
     }
-    h = proof_hash(payload)
-    return ProofLog(
-        law_title=req.schema.law_title,
-        schema=req.schema,
-        data_checked=req.data,
-        results=results,
-        overall_passed=overall,
-        proof_hash=h,
-    )
+    return bool(ops[schema.op](left, right))
 
-# -------------------------
-# Minimal UI for a "first wow"
-# -------------------------
-INDEX_HTML = """
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Law-to-Code MVP — DCL + CLEARANCE</title>
-  <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; line-height: 1.4; }
-    h1 { margin-bottom: 0; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-    textarea { width: 100%; height: 180px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    pre { background: #f6f7f9; padding: 12px; border-radius: 8px; overflow: auto; }
-    button { padding: 10px 16px; border: 0; border-radius: 8px; background: #111; color: #fff; cursor: pointer; }
-    .ok { color: #16794d; font-weight: 600; }
-    .nok { color: #b00020; font-weight: 600; }
-    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; }
-    label { font-size: 12px; color: #555; }
-  </style>
-</head>
-<body>
-  <h1>Law-to-Code MVP</h1>
-  <p><strong>DCL + CLEARANCE</strong> — parse simple legal rules → check data → produce a <em>proof hash</em>.</p>
-
-  <div class="grid">
-    <div class="card">
-      <h3>1) Law Text → DCL</h3>
-      <label>Law Title</label>
-      <input id="law_title" style="width:100%;margin-bottom:8px" value="ESPR demo snippet" />
-      <label>Law Text (one rule per line)</label>
-      <textarea id="law_text">require manufacturer
-require category
-in category [electronics, furniture]
-max weight 50
-</textarea>
-      <button onclick="parseDCL()">Parse to DCL</button>
-      <h4>Schema (DCL)</h4>
-      <pre id="schema_out"></pre>
-    </div>
-
-    <div class="card">
-      <h3>2) Data → CLEARANCE</h3>
-      <label>Product JSON</label>
-      <textarea id="data_json">{
-  "manufacturer": "ACME",
-  "category": "electronics",
-  "weight": 42
-}</textarea>
-      <button onclick="runClearance()">Run CLEARANCE</button>
-      <h4>Result</h4>
-      <div id="result"></div>
-      <h4>Proof Log</h4>
-      <pre id="proof"></pre>
-    </div>
-  </div>
-<script>
-  // Sterk en simpel: altijd zichtbaar updaten, met foutmeldingen
-  const schemaOut = document.getElementById('schema_out');
-  const resultBox = document.getElementById('result');
-  const proofBox  = document.getElementById('proof');
-  const lawTextEl = document.getElementById('law_text');
-  const lawTitleEl= document.getElementById('law_title');
-  const dataEl    = document.getElementById('data_json');
-
-  let lastSchema = null;
-
-  function showError(msg) {
-    resultBox.innerHTML = '<span class="nok">' + msg + '</span>';
-  }
-
-  async function parseDCL() {
-    try {
-      resultBox.innerHTML = ''; // leegmaken
-      proofBox.textContent = '';
-      const law_text = lawTextEl.value;
-      const law_title = lawTitleEl.value || 'Law Snippet';
-      const res = await fetch('/dcl/parse', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ law_text, law_title })
-      });
-      if (!res.ok) throw new Error('Server antwoordt niet (parse).');
-      const data = await res.json();
-      lastSchema = data;
-      schemaOut.textContent = JSON.stringify(data, null, 2);
-      // breng het resultaat in beeld
-      schemaOut.parentElement.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    } catch (e) {
-      console.error(e);
-      showError('Kon DCL niet aanmaken: ' + e.message);
-    }
-  }
-
-  async function runClearance() {
-    try {
-      if (!lastSchema) await parseDCL();
-      let payload;
-      try {
-        payload = JSON.parse(dataEl.value);
-      } catch (e) {
-        showError('De rechter JSON is ongeldig. Corrigeer en probeer opnieuw.');
-        return;
-      }
-      const res = await fetch('/clearance/check', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ schema: lastSchema, data: payload })
-      });
-      if (!res.ok) throw new Error('Server antwoordt niet (clearance).');
-      const proof = await res.json();
-      const badge = proof.overall_passed
-        ? '<span class="ok">COMPLIANT</span>'
-        : '<span class="nok">NON-COMPLIANT</span>';
-      resultBox.innerHTML = `Overall: ${badge}<br/>Proof Hash: <code>${proof.proof_hash}</code>`;
-      proofBox.textContent = JSON.stringify(proof, null, 2);
-      resultBox.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    } catch (e) {
-      console.error(e);
-      showError('CLEARANCE mislukt: ' + e.message);
-    }
-  }
-
-  // Knoppen koppelen
-  // (Je hebt inline onclick al, maar dit zorgt dat het altijd werkt)
-  window.parseDCL = parseDCL;
-  window.runClearance = runClearance;
-
-  // Auto-parse bij het laden
-  parseDCL();
-</script>
-</body>
-</html>
-"""
-
+# --- UI / Health ---
 @app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTMLResponse(INDEX_HTML)
+def root():
+    return """
+    <html><body style="font-family:system-ui;margin:2rem">
+      <h2>Law-to-Code MVP</h2>
+      <p>Try <code>/docs</code> for the API.</p>
+    </body></html>
+    """
+
+@app.get("/health")
+def health():
+    with engine.connect() as conn:
+        conn.execute("SELECT 1")
+    return {"ok": True, "db": "up"}
+
+# --- DCL / CLEARANCE ---
+@app.post("/dcl/parse")
+def dcl_parse(req: ParseRequest):
+    schema = parse_rule(req.text)
+    return schema.model_dump()
+
+@app.post("/clearance/check")
+def clearance_check(req: ClearanceRequest, x_api_key: Optional[str] = Header(default=None)):
+    require_api_key(x_api_key)
+
+    schema = parse_rule(req.rule)
+    passed = evaluate(schema, req.data)
+
+    proof_log = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "rule": schema.model_dump(),
+        "data": req.data,
+        "result": "pass" if passed else "fail",
+    }
+    digest = hashlib.sha256(json.dumps(proof_log, sort_keys=True).encode("utf-8")).hexdigest()
+
+    # persist
+    with SessionLocal() as s:
+        p = Proof(
+            rule_text=req.rule,
+            data=req.data,
+            result="pass" if passed else "fail",
+            hash=digest,
+            proof_log=proof_log,
+        )
+        s.add(p)
+        s.commit()
+        s.refresh(p)
+
+    return {"id": p.id, "hash": digest, "result": p.result, "proof": proof_log}
+
+# --- Retrieval ---
+@app.get("/proofs")
+def list_proofs(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    with SessionLocal() as s:
+        total = s.query(Proof).count()
+        rows: List[Proof] = (
+            s.query(Proof)
+            .order_by(Proof.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "items": [
+                {
+                    "id": r.id,
+                    "created_at": r.created_at,
+                    "result": r.result,
+                    "hash": r.hash,
+                    "rule_text": r.rule_text,
+                } for r in rows
+            ],
+        }
+
+@app.get("/proofs/{proof_id}")
+def get_proof(proof_id: str):
+    with SessionLocal() as s:
+        r = s.get(Proof, proof_id)
+        if not r:
+            raise HTTPException(404, "Not found")
+        return {
+            "id": r.id,
+            "created_at": r.created_at,
+            "result": r.result,
+            "hash": r.hash,
+            "rule_text": r.rule_text,
+            "data": r.data,
+            "proof": r.proof_log,
+        }
