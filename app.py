@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 
 # --- SQLAlchemy / Postgres ---
 from sqlalchemy import create_engine, Column, String, DateTime, Text, JSON, Integer
+from sqlalchemy import text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -122,7 +123,7 @@ def root():
 @app.get("/health")
 def health():
     with engine.connect() as conn:
-        conn.execute("SELECT 1")
+        conn.execute(text("SELECT 1"))
     return {"ok": True, "db": "up"}
 
 # --- DCL / CLEARANCE ---
