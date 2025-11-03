@@ -21,6 +21,27 @@ import os, json, re, hashlib
 from datetime import datetime, timezone
 from typing import Any, Optional, List, Dict
 from uuid import uuid4
+import os, logging
+from fastapi.responses import JSONResponse
+from fastapi import Request
+
+# Debug logging to verify API_KEY loading and requests
+API_KEY = os.getenv("API_KEY")
+logging.warning(f"Loaded API_KEY from env: {repr(API_KEY)}")
+
+@app.middleware("http")
+async def check_api_key(request: Request, call_next):
+    if request.url.path.startswith("/clearance"):
+        key = request.headers.get("x-api-key")
+        logging.warning(f"Incoming x-api-key header: {repr(key)}")
+
+        if not API_KEY:
+            return JSONResponse(status_code=500, content={"detail": "Server misconfigured: no API_KEY in env"})
+
+        if not key or key.strip() != API_KEY.strip():
+            return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key"})
+
+    return await call_next(request)
 
 from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.responses import HTMLResponse
