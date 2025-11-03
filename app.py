@@ -284,40 +284,81 @@ max weight 50
       <pre id="proof"></pre>
     </div>
   </div>
+<script>
+  // Sterk en simpel: altijd zichtbaar updaten, met foutmeldingen
+  const schemaOut = document.getElementById('schema_out');
+  const resultBox = document.getElementById('result');
+  const proofBox  = document.getElementById('proof');
+  const lawTextEl = document.getElementById('law_text');
+  const lawTitleEl= document.getElementById('law_title');
+  const dataEl    = document.getElementById('data_json');
 
-  <script>
-    let lastSchema = null;
+  let lastSchema = null;
 
-    async function parseDCL() {
-      const law_text = document.getElementById('law_text').value;
-      const law_title = document.getElementById('law_title').value;
+  function showError(msg) {
+    resultBox.innerHTML = '<span class="nok">' + msg + '</span>';
+  }
+
+  async function parseDCL() {
+    try {
+      resultBox.innerHTML = ''; // leegmaken
+      proofBox.textContent = '';
+      const law_text = lawTextEl.value;
+      const law_title = lawTitleEl.value || 'Law Snippet';
       const res = await fetch('/dcl/parse', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ law_text, law_title })
       });
+      if (!res.ok) throw new Error('Server antwoordt niet (parse).');
       const data = await res.json();
       lastSchema = data;
-      document.getElementById('schema_out').textContent = JSON.stringify(data, null, 2);
+      schemaOut.textContent = JSON.stringify(data, null, 2);
+      // breng het resultaat in beeld
+      schemaOut.parentElement.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (e) {
+      console.error(e);
+      showError('Kon DCL niet aanmaken: ' + e.message);
     }
+  }
 
-    async function runClearance() {
+  async function runClearance() {
+    try {
       if (!lastSchema) await parseDCL();
-      const dataStr = document.getElementById('data_json').value;
-      let data;
-      try { data = JSON.parse(dataStr); } catch(e) { alert('Invalid JSON for data'); return; }
+      let payload;
+      try {
+        payload = JSON.parse(dataEl.value);
+      } catch (e) {
+        showError('De rechter JSON is ongeldig. Corrigeer en probeer opnieuw.');
+        return;
+      }
       const res = await fetch('/clearance/check', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ schema: lastSchema, data })
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ schema: lastSchema, data: payload })
       });
+      if (!res.ok) throw new Error('Server antwoordt niet (clearance).');
       const proof = await res.json();
-      document.getElementById('proof').textContent = JSON.stringify(proof, null, 2);
-      const badge = proof.overall_passed ? '<span class="ok">COMPLIANT</span>' : '<span class="nok">NON-COMPLIANT</span>';
-      document.getElementById('result').innerHTML = `Overall: ${badge}<br/>Proof Hash: <code>${proof.proof_hash}</code>`;
+      const badge = proof.overall_passed
+        ? '<span class="ok">COMPLIANT</span>'
+        : '<span class="nok">NON-COMPLIANT</span>';
+      resultBox.innerHTML = `Overall: ${badge}<br/>Proof Hash: <code>${proof.proof_hash}</code>`;
+      proofBox.textContent = JSON.stringify(proof, null, 2);
+      resultBox.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    } catch (e) {
+      console.error(e);
+      showError('CLEARANCE mislukt: ' + e.message);
     }
+  }
 
-    // Auto-parse on load
-    parseDCL();
-  </script>
+  // Knoppen koppelen
+  // (Je hebt inline onclick al, maar dit zorgt dat het altijd werkt)
+  window.parseDCL = parseDCL;
+  window.runClearance = runClearance;
+
+  // Auto-parse bij het laden
+  parseDCL();
+</script>
 </body>
 </html>
 """
