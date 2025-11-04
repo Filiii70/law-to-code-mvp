@@ -1,9 +1,9 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security.api_key import APIKeyHeader, APIKeyQuery
+from fastapi.security.api_key import APIKeyHeader
 from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel
-from datetime import datetime, timezone
+from datetime import datetime
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 import hashlib, os, json, logging
@@ -14,7 +14,9 @@ app = FastAPI(title="Law-to-Code MVP — DCL + CLEARANCE + Storage", version="1.
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ---- DB ----
@@ -30,7 +32,7 @@ class Proof(Base):
     data = Column(Text)
     result = Column(String(50))
     hash = Column(String(64))
-    timestamp = Column(DateTime, default=datetime.now(timezone.utc))
+    timestamp = Column(DateTime, default=datetime.utcnow)  # eenvoudiger en veilig
 
 Base.metadata.create_all(bind=engine)
 
@@ -39,43 +41,34 @@ class RuleInput(BaseModel):
     rule: str
     data: dict
 
-# ---- API Key (header of query) ----
+# ---- API Key (alleen header) ----
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
-api_key_query  = APIKeyQuery(name="api_key", auto_error=False)
 
-def require_api_key(
-    key_h: str | None = Depends(api_key_header),
-    key_q: str | None = Depends(api_key_query),
-):
+def require_api_key(key_h: str | None = Depends(api_key_header)):
     expected = os.getenv("API_KEY")
     if not expected:
         return None
-    provided = key_h or key_q
-    if not provided or provided != expected:
+    if not key_h or key_h != expected:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
     return None
 
-# ---- OpenAPI met security (zorgt voor 🔒 Authorize) ----
+# ---- OpenAPI (enkel header-sleutel zichtbaar) ----
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
     schema = get_openapi(
         title=app.title,
         version=app.version,
-        description="Law-to-Code MVP",
+        description="Law-to-Code MVP — enkel x-api-key header",
         routes=app.routes,
     )
     schema.setdefault("components", {}).setdefault("securitySchemes", {})
     schema["components"]["securitySchemes"]["APIKeyHeader"] = {
         "type": "apiKey", "name": "x-api-key", "in": "header"
     }
-    schema["components"]["securitySchemes"]["APIKeyQuery"] = {
-        "type": "apiKey", "name": "api_key", "in": "query"
-    }
-    # Zet security op alle paths → Authorize-knop verschijnt
     for path in schema.get("paths", {}).values():
         for method in path.values():
-            method.setdefault("security", [{"APIKeyHeader": []}, {"APIKeyQuery": []}])
+            method.setdefault("security", [{"APIKeyHeader": []}])
     app.openapi_schema = schema
     return app.openapi_schema
 
@@ -117,10 +110,18 @@ def clearance_check(input: RuleInput):
     try:
         result = evaluate_rule(input.rule, input.data)
         h = hash_proof(input.rule, input.data, result)
-        proof = Proof(rule=input.rule, data=json.dumps(input.data), result=str(result), hash=h)
+        proof = Proof(
+            rule=input.rule,
+            data=json.dumps(input.data),
+            result=str(result),
+            hash=h,
+        )
         session.add(proof)
         session.commit()
         return {"result": result, "hash": h, "id": proof.id}
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         session.close()
 
@@ -128,10 +129,16 @@ def clearance_check(input: RuleInput):
 def list_proofs():
     session = SessionLocal()
     try:
-        rows = session.query(Proof).order_by(Proof.id.desc()).all()
+        items = session.query(Proof).order_by(Proof.id.desc()).all()
         return [
-            {"id": p.id, "rule": p.rule, "result": p.result, "hash": p.hash, "timestamp": p.timestamp.isoformat()}
-            for p in rows
+            {
+                "id": p.id,
+                "rule": p.rule,
+                "result": p.result,
+                "hash": p.hash,
+                "timestamp": p.timestamp.isoformat(),
+            }
+            for p in items
         ]
     finally:
         session.close()
@@ -144,8 +151,12 @@ def get_proof(proof_id: int):
         if not p:
             raise HTTPException(status_code=404, detail="Proof not found")
         return {
-            "id": p.id, "rule": p.rule, "data": json.loads(p.data),
-            "result": p.result, "hash": p.hash, "timestamp": p.timestamp.isoformat()
+            "id": p.id,
+            "rule": p.rule,
+            "data": json.loads(p.data),
+            "result": p.result,
+            "hash": p.hash,
+            "timestamp": p.timestamp.isoformat(),
         }
     finally:
         session.close()
