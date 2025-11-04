@@ -1,4 +1,5 @@
 # app.py — Law-to-Code MVP (DCL + CLEARANCE + Storage)
+# app.py — Law-to-Code MVP (DCL + CLEARANCE + Storage)
 # - Swagger UI op /docs (FastAPI standaard)  ✅
 # - Healthcheck /health met DB ping (text('SELECT 1'))  ✅
 # - API-key beveiliging voor POST (header: x-api-key)  ✅
