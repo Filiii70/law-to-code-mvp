@@ -1,5 +1,4 @@
 from fastapi import FastAPI, HTTPException, Depends
-from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader, APIKeyQuery
 from pydantic import BaseModel
@@ -14,7 +13,9 @@ app = FastAPI(title="Law-to-Code MVP — DCL + CLEARANCE + Storage")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ------------- DB --------------------
@@ -39,7 +40,7 @@ class RuleInput(BaseModel):
     rule: str
     data: dict
 
-# ----------- API Key (Header OR ?api_key=) ----------
+# ----------- API Key: header of ?api_key= ----------
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 api_key_query  = APIKeyQuery(name="api_key", auto_error=False)
 
@@ -49,7 +50,7 @@ def require_api_key(
 ):
     expected = os.getenv("API_KEY")
     if not expected:
-        return None  # geen key ingesteld => publiek
+        return None
     provided = key_h or key_q
     if not provided or provided != expected:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
@@ -58,28 +59,19 @@ def require_api_key(
 # ------------- Helpers ---------------
 def evaluate_rule(rule: str, data: dict) -> bool:
     try:
+        # sandbox eval (zonder builtins)
         return bool(eval(rule, {"__builtins__": {}}, data))
     except Exception:
         return False
 
 def hash_proof(rule: str, data: dict, result: bool) -> str:
-    content = f"{rule}|{json.dumps(data, sort_keys=True)}|{result}"
-    return hashlib.sha256(content.encode()).hexdigest()
+    payload = f"{rule}|{json.dumps(data, sort_keys=True)}|{result}"
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 # -------------- Routes ---------------
-@app.get("/", response_class=HTMLResponse)
-def index():
-    html = (
-        "<!doctype html>\n"
-        "<html>\n"
-        "  <body style='font-family:Arial; margin:40px;'>\n"
-        "    <h1>Law-to-Code MVP</h1>\n"
-        "    <p>DCL + CLEARANCE + Storage</p>\n"
-        "    <p><a href='/docs'>Open Swagger UI</a></p>\n"
-        "  </body>\n"
-        "</html>\n"
-    )
-    return HTMLResponse(content=html)
+@app.get("/")
+def root():
+    return {"app": "Law-to-Code MVP", "docs": "/docs"}
 
 @app.get("/health")
 def health_check():
@@ -91,7 +83,7 @@ def health_check():
         return {"status": "error", "db": str(e)}
 
 @app.post("/dcl/parse", dependencies=[Depends(require_api_key)])
-def parse_rule(input: RuleInput):
+def dcl_parse(input: RuleInput):
     rule = input.rule.strip()
     return {"parsed_rule": {"expression": rule, "fields": list(input.data.keys())}}
 
@@ -104,8 +96,7 @@ def clearance_check(input: RuleInput):
         proof = Proof(rule=input.rule, data=json.dumps(input.data), result=str(result), hash=h)
         session.add(proof)
         session.commit()
-        pid = proof.id
-        return {"result": result, "hash": h, "id": pid}
+        return {"result": result, "hash": h, "id": proof.id}
     finally:
         session.close()
 
@@ -115,7 +106,13 @@ def list_proofs():
     try:
         items = session.query(Proof).order_by(Proof.id.desc()).all()
         return [
-            {"id": p.id, "rule": p.rule, "result": p.result, "hash": p.hash, "timestamp": p.timestamp.isoformat()}
+            {
+                "id": p.id,
+                "rule": p.rule,
+                "result": p.result,
+                "hash": p.hash,
+                "timestamp": p.timestamp.isoformat(),
+            }
             for p in items
         ]
     finally:
@@ -138,9 +135,3 @@ def get_proof(proof_id: int):
         }
     finally:
         session.close()
-
-# -------- Local run (ignored on Render) --------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000)
-pp:app", host="0.0.0.0", port=8000)
