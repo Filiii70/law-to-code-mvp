@@ -8,7 +8,7 @@ from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, t
 from sqlalchemy.orm import sessionmaker, declarative_base
 import hashlib, os, json, logging
 
-# ---- App ----
+# ---------------- App ----------------
 logging.basicConfig(level=logging.INFO)
 app = FastAPI(title="Law-to-Code MVP — DCL + CLEARANCE + Storage", version="1.0.0")
 
@@ -19,7 +19,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---- DB ----
+# ---------------- Database ----------------
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./lawtocode.db")
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
@@ -32,16 +32,16 @@ class Proof(Base):
     data = Column(Text)
     result = Column(String(50))
     hash = Column(String(64))
-    timestamp = Column(DateTime, default=datetime.utcnow)  # eenvoudiger en veilig
+    timestamp = Column(DateTime, default=datetime.utcnow)  # simpel en veilig
 
 Base.metadata.create_all(bind=engine)
 
-# ---- Models ----
+# ---------------- Models ----------------
 class RuleInput(BaseModel):
     rule: str
     data: dict
 
-# ---- API Key (alleen header) ----
+# ---------------- API Key (alleen header) ----------------
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
 def require_api_key(key_h: str | None = Depends(api_key_header)):
@@ -52,7 +52,7 @@ def require_api_key(key_h: str | None = Depends(api_key_header)):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
     return None
 
-# ---- OpenAPI (enkel header-sleutel zichtbaar) ----
+# ---------------- OpenAPI: alleen header-key tonen ----------------
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
@@ -74,7 +74,7 @@ def custom_openapi():
 
 app.openapi = custom_openapi
 
-# ---- Helpers ----
+# ---------------- Helpers ----------------
 def evaluate_rule(rule: str, data: dict) -> bool:
     try:
         return bool(eval(rule, {"__builtins__": {}}, data))
@@ -85,7 +85,7 @@ def hash_proof(rule: str, data: dict, result: bool) -> str:
     payload = f"{rule}|{json.dumps(data, sort_keys=True)}|{result}"
     return hashlib.sha256(payload.encode()).hexdigest()
 
-# ---- Routes ----
+# ---------------- Routes ----------------
 @app.get("/")
 def root():
     return {"app": "Law-to-Code MVP", "docs": "/docs"}
@@ -110,12 +110,7 @@ def clearance_check(input: RuleInput):
     try:
         result = evaluate_rule(input.rule, input.data)
         h = hash_proof(input.rule, input.data, result)
-        proof = Proof(
-            rule=input.rule,
-            data=json.dumps(input.data),
-            result=str(result),
-            hash=h,
-        )
+        proof = Proof(rule=input.rule, data=json.dumps(input.data), result=str(result), hash=h)
         session.add(proof)
         session.commit()
         return {"result": result, "hash": h, "id": proof.id}
@@ -160,3 +155,14 @@ def get_proof(proof_id: int):
         }
     finally:
         session.close()
+
+# ---------------- Admin: reset tabel zonder psql ----------------
+from sqlalchemy import text as _sqltext
+
+@app.post("/admin/reset", dependencies=[Depends(require_api_key)])
+def admin_reset():
+    # verwijder oude/kapotte tabel en maak ze opnieuw aan
+    with engine.begin() as conn:
+        conn.execute(_sqltext("DROP TABLE IF EXISTS proofs CASCADE;"))
+    Base.metadata.create_all(bind=engine)
+    return {"reset": "ok"}
