@@ -1,9 +1,5 @@
-# ============================================================
-# Law-to-Code MVP — DCL + CLEARANCE + Storage (PostgreSQL)
-# ============================================================
-
 from fastapi import FastAPI, HTTPException, Header, Depends
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime, timezone
@@ -12,7 +8,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 import hashlib, os, json, logging
 
 # ------------------------------------------------------------
-# Setup
+# App & CORS
 # ------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 app = FastAPI(title="Law-to-Code MVP — DCL + CLEARANCE + Storage")
@@ -51,14 +47,13 @@ class RuleInput(BaseModel):
     data: dict
 
 # ------------------------------------------------------------
-# API-key dependency (toont x-api-key in Swagger)
+# API-key dependency (Swagger toont x-api-key veld automatisch)
 # ------------------------------------------------------------
 def require_api_key(x_api_key: str | None = Header(default=None, convert_underscores=False)):
     expected = os.getenv("API_KEY")
     if expected:
         if not x_api_key or x_api_key != expected:
             raise HTTPException(status_code=401, detail="Invalid or missing API key")
-    # Als er geen API_KEY is gezet, is alles openbaar.
     return None
 
 # ------------------------------------------------------------
@@ -66,7 +61,6 @@ def require_api_key(x_api_key: str | None = Header(default=None, convert_undersc
 # ------------------------------------------------------------
 def evaluate_rule(rule: str, data: dict) -> bool:
     try:
-        # sandboxed eval: geen builtins
         return bool(eval(rule, {"__builtins__": {}}, data))
     except Exception:
         return False
@@ -80,16 +74,16 @@ def hash_proof(rule: str, data: dict, result: bool) -> str:
 # ------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index():
-    html = '''
-    <!doctype html>
-    <html>
-      <body style="font-family:Arial; margin:40px;">
-        <h1>Law-to-Code MVP</h1>
-        <p>DCL + CLEARANCE + Storage</p>
-        <p><a href="/docs">Open Swagger UI</a></p>
-      </body>
-    </html>
-    '''
+    html = (
+        "<!doctype html>\n"
+        "<html>\n"
+        "  <body style='font-family:Arial; margin:40px;'>\n"
+        "    <h1>Law-to-Code MVP</h1>\n"
+        "    <p>DCL + CLEARANCE + Storage</p>\n"
+        "    <p><a href='/docs'>Open Swagger UI</a></p>\n"
+        "  </body>\n"
+        "</html>\n"
+    )
     return HTMLResponse(content=html)
 
 @app.get("/health")
@@ -103,7 +97,6 @@ def health_check():
 
 @app.post("/dcl/parse")
 def parse_rule(input: RuleInput, _: None = Depends(require_api_key)):
-    # ultra-simple parser
     rule = input.rule.strip()
     return {"parsed_rule": {"expression": rule, "fields": list(input.data.keys())}}
 
@@ -113,4 +106,51 @@ def clearance_check(input: RuleInput, _: None = Depends(require_api_key)):
     try:
         result = evaluate_rule(input.rule, input.data)
         h = hash_proof(input.rule, input.data, result)
-app:app", host="0.0.0.0", port=8000)
+        session.add(Proof(rule=input.rule, data=json.dumps(input.data), result=str(result), hash=h))
+        session.commit()
+        return {"result": result, "hash": h, "id": session.query(Proof).order_by(Proof.id.desc()).first().id}
+    finally:
+        session.close()
+
+@app.get("/proofs")
+def list_proofs():
+    session = SessionLocal()
+    try:
+        items = session.query(Proof).order_by(Proof.id.desc()).all()
+        return [
+            {
+                "id": p.id,
+                "rule": p.rule,
+                "result": p.result,
+                "hash": p.hash,
+                "timestamp": p.timestamp.isoformat(),
+            }
+            for p in items
+        ]
+    finally:
+        session.close()
+
+@app.get("/proofs/{proof_id}")
+def get_proof(proof_id: int):
+    session = SessionLocal()
+    try:
+        p = session.query(Proof).filter(Proof.id == proof_id).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="Proof not found")
+        return {
+            "id": p.id,
+            "rule": p.rule,
+            "data": json.loads(p.data),
+            "result": p.result,
+            "hash": p.hash,
+            "timestamp": p.timestamp.isoformat(),
+        }
+    finally:
+        session.close()
+
+# ------------------------------------------------------------
+# Local run (ignored on Render, safe to keep)
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=8000)
