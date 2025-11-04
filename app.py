@@ -2,89 +2,86 @@
 Law-to-Code MVP — DCL + CLEARANCE + Storage (PostgreSQL)
 
 Routes:
-GET /                : mini UI/hello
-GET /docs            : Swagger UI
-GET /health          : DB healthcheck
-POST /dcl/parse      : parse rule-text → JSON schema
-POST /clearance/check: evaluate + persist proof
-GET /proofs          : list proofs (paginated)
-GET /proofs/{id}     : get single proof
+GET  /                 : mini UI/hello
+GET  /docs             : Swagger UI
+GET  /health           : DB healthcheck
+POST /dcl/parse        : parse rule-text → JSON schema
+POST /clearance/check  : evaluate + persist proof
+GET  /proofs           : list proofs (paginated)
+GET  /proofs/{id}      : get single proof
 
-Env:
+Env (Render):
 DATABASE_URL = postgresql://USER:PASS@HOST:PORT/DB
-API_KEY      = optional; when set, POST routes require header: x-api-key
+API_KEY      = optional; when set, POST /clearance/check requires header: x-api-key
 """
+
+from __future__ import annotations
+
+import os
+import json
+import hashlib
+import logging
+from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, HTMLResponse
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from datetime import datetime, timezone
-import os
-import logging
-import hashlib
-import json
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+
+from sqlalchemy import create_engine, text, Column, Integer, String, Text, DateTime
+from sqlalchemy.orm import sessionmaker, declarative_base
 
 # ============================================================
-# INITIAL SETUP
+# FASTAPI APP
 # ============================================================
 
 app = FastAPI(title="Law-to-Code MVP", version="1.0")
 
-# Database setup --------------------------------------------------------------
-DATABASE_URL = os.getenv("DATABASE_URL")
-engine = create_engine(DATABASE_URL) if DATABASE_URL else None
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine) if engine else None
-Base = declarative_base()
+# ============================================================
+# DATABASE
+# ============================================================
 
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,   # helpt bij slapende/verbroken connecties
+    future=True
+) if DATABASE_URL else None
+
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True) if engine else None
+Base = declarative_base()
 
 class Proof(Base):
     __tablename__ = "proofs"
     id = Column(Integer, primary_key=True, index=True)
-    rule = Column(Text)
-    data = Column(Text)
-    result = Column(String(10))
-    proof_hash = Column(String(64))
-    timestamp = Column(DateTime, default=datetime.now(timezone.utc))
-
+    rule = Column(Text, nullable=False)
+    data = Column(Text, nullable=False)
+    result = Column(String(10), nullable=False)
+    proof_hash = Column(String(64), nullable=False)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 if engine:
     Base.metadata.create_all(bind=engine)
 
 # ============================================================
-# SECURITY: API-KEY CHECK
+# SECURITY: API-KEY (OPTIONEEL)
 # ============================================================
 
-API_KEY = os.getenv("API_KEY")
-logging.warning(f"Loaded API_KEY from env: {repr(API_KEY)}")
-
+API_KEY: Optional[str] = os.getenv("API_KEY")
+logging.warning(f"API_KEY present: {bool(API_KEY)}")
 
 @app.middleware("http")
-async def check_api_key(request: Request, call_next):
+async def optional_api_key_for_clearance(request: Request, call_next):
     """
-    Middleware die elke /clearance-route controleert op een geldige API-key.
+    Vereist x-api-key op /clearance/check ALLEEN als API_KEY is gezet in de omgeving.
+    Zo vermijden we 500/401 verwarring tijdens testen.
     """
-    if request.url.path.startswith("/clearance"):
-        key = request.headers.get("x-api-key")
-        logging.warning(f"Incoming x-api-key header: {repr(key)}")
-
-        if not API_KEY:
-            return JSONResponse(
-                status_code=500,
-                content={"detail": "Server misconfigured: no API_KEY in env"}
-            )
-
-        if not key or key.strip() != API_KEY.strip():
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Invalid or missing API key"}
-            )
-
+    if API_KEY and request.url.path.startswith("/clearance"):
+        key = request.headers.get("x-api-key", "")
+        if key.strip() != API_KEY.strip():
+            return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key"})
     return await call_next(request)
-
 
 # ============================================================
 # MODELS
@@ -93,7 +90,6 @@ async def check_api_key(request: Request, call_next):
 class RuleRequest(BaseModel):
     rule: str
     data: dict
-
 
 # ============================================================
 # BASIC ROUTES
@@ -105,30 +101,25 @@ async def home():
     return """
     <html>
       <head><title>Law-to-Code MVP</title></head>
-      <body style='font-family: sans-serif;'>
+      <body style='font-family: sans-serif; max-width: 720px; margin: 2rem auto;'>
         <h2>✅ Law-to-Code MVP – DCL + CLEARANCE</h2>
-        <form method='post' action='/clearance/check'>
-          Rule: <input name='rule' value='age >= 18'><br><br>
-          Data (JSON): <input name='data' value='{"age":20}'><br><br>
-          <button type='submit'>Test rule</button>
-        </form>
+        <p>Probeer via <a href="/docs" target="_blank">/docs</a> de endpoints.</p>
+        <p><b>Tip:</b> Voor POST /clearance/check: header <code>x-api-key: &lt;jouw key&gt;</code> is alleen nodig als je in Render <code>API_KEY</code> hebt gezet.</p>
       </body>
     </html>
     """
 
-
 @app.get("/health")
 async def health_check():
-    """Eenvoudige healthcheck + DB-test."""
+    """Eenvoudige health + DB-test, compatibel met SQLAlchemy 2.x."""
     if not engine:
         return {"status": "ok", "db": "not configured"}
     try:
         with engine.connect() as conn:
-            conn.execute("SELECT 1")
+            conn.execute(text("SELECT 1"))
         return {"status": "ok", "db": "connected"}
     except Exception as e:
         return {"status": "error", "db": str(e)}
-
 
 # ============================================================
 # DCL PARSER
@@ -144,45 +135,49 @@ async def parse_rule(request: RuleRequest):
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
 
-
 # ============================================================
-# CLEARANCE CHECK
+# CLEARANCE CHECK (MVP)
 # ============================================================
 
 @app.post("/clearance/check")
 async def clearance_check(request: RuleRequest):
-    """Evalueert data tegen regel en bewaart het resultaat als bewijs."""
+    """
+    Evalueert data tegen regel en bewaart het resultaat als bewijs.
+    LET OP: 'eval' is enkel voor MVP/demo (geen onveilige invoer gebruiken in productie).
+    """
     rule_text = request.rule
     data = request.data
 
     try:
-        result = eval(rule_text, {}, data)
+        # Minimalistische evaluatie: bv. rule = "age >= 18", data={"age": 20}
+        result = bool(eval(rule_text, {}, data))  # MVP, niet voor productie
+
         proof_data = {
             "rule": rule_text,
-            "data": json.dumps(data),
+            "data": json.dumps(data, sort_keys=True),
             "result": str(result),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        proof_json = json.dumps(proof_data, sort_keys=True)
-        proof_hash = hashlib.sha256(proof_json.encode()).hexdigest()
+        proof_hash = hashlib.sha256(json.dumps(proof_data, sort_keys=True).encode()).hexdigest()
 
         if SessionLocal:
             db = SessionLocal()
-            new_proof = Proof(
-                rule=rule_text,
-                data=json.dumps(data),
-                result=str(result),
-                proof_hash=proof_hash
-            )
-            db.add(new_proof)
-            db.commit()
-            db.close()
+            try:
+                new_proof = Proof(
+                    rule=rule_text,
+                    data=json.dumps(data, sort_keys=True),
+                    result=str(result),
+                    proof_hash=proof_hash,
+                )
+                db.add(new_proof)
+                db.commit()
+            finally:
+                db.close()
 
         return {"result": result, "proof_hash": proof_hash}
 
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
-
 
 # ============================================================
 # PROOF STORAGE
@@ -190,24 +185,25 @@ async def clearance_check(request: RuleRequest):
 
 @app.get("/proofs")
 async def list_proofs():
-    """Lijst met opgeslagen bewijzen (optioneel paginated)."""
+    """Lijst met opgeslagen bewijzen."""
     if not SessionLocal:
         return {"error": "Database not configured"}
     db = SessionLocal()
-    proofs = db.query(Proof).all()
-    db.close()
-    return [
-        {
-            "id": p.id,
-            "rule": p.rule,
-            "data": json.loads(p.data),
-            "result": p.result,
-            "proof_hash": p.proof_hash,
-            "timestamp": p.timestamp.isoformat()
-        }
-        for p in proofs
-    ]
-
+    try:
+        proofs = db.query(Proof).order_by(Proof.id.desc()).all()
+        return [
+            {
+                "id": p.id,
+                "rule": p.rule,
+                "data": json.loads(p.data),
+                "result": p.result,
+                "proof_hash": p.proof_hash,
+                "timestamp": p.timestamp.isoformat()
+            }
+            for p in proofs
+        ]
+    finally:
+        db.close()
 
 @app.get("/proofs/{proof_id}")
 async def get_proof(proof_id: int):
@@ -215,22 +211,23 @@ async def get_proof(proof_id: int):
     if not SessionLocal:
         return {"error": "Database not configured"}
     db = SessionLocal()
-    proof = db.query(Proof).filter(Proof.id == proof_id).first()
-    db.close()
-    if proof:
+    try:
+        p = db.query(Proof).filter(Proof.id == proof_id).first()
+        if not p:
+            return JSONResponse(status_code=404, content={"detail": "Proof not found"})
         return {
-            "id": proof.id,
-            "rule": proof.rule,
-            "data": json.loads(proof.data),
-            "result": proof.result,
-            "proof_hash": proof.proof_hash,
-            "timestamp": proof.timestamp.isoformat()
+            "id": p.id,
+            "rule": p.rule,
+            "data": json.loads(p.data),
+            "result": p.result,
+            "proof_hash": p.proof_hash,
+            "timestamp": p.timestamp.isoformat()
         }
-    return JSONResponse(status_code=404, content={"detail": "Proof not found"})
-
+    finally:
+        db.close()
 
 # ============================================================
-# RUN LOCALLY (for development)
+# RUN LOCALLY (development)
 # ============================================================
 
 if __name__ == "__main__":
